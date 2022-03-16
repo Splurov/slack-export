@@ -62,6 +62,7 @@ if (!targetFolder) {
         yield service.export();
     }
     catch (x) {
+        throw x;
         console.log(chalk_1.default.red(`Error processing : ${x}`));
     }
 }))();

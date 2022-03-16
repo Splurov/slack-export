@@ -35,6 +35,9 @@ const REQUIRED_SCOPES = [
     'files:read',
     'users:read'
 ];
+
+const RATE_LIMIT_DELAY = 500;
+
 function delay(ms) {
     return __awaiter(this, void 0, void 0, function* () {
         yield timeout(ms);
@@ -69,6 +72,7 @@ class APIService {
     export() {
         var _a;
         return __awaiter(this, void 0, void 0, function* () {
+            console.log(`Started at ${new Date().toLocaleString()}`);
             try {
                 yield fs_1.promises.access(this.exportRoot);
             }
@@ -94,10 +98,13 @@ class APIService {
             }
             console.log(chalk_1.default.greenBright('    Confirmed all necessary scopes present'));
             yield this.loadUsers();
+            //return;
             yield this.loadConversations();
             for (const conv of this.conversations) {
+                yield delay(RATE_LIMIT_DELAY);
                 yield this.writeNewMsgs(conv, this.startDate, this.endDate);
             }
+            console.log(`Ended at ${new Date().toLocaleString()}`);
         });
     }
     downloadFile(conv, file) {
@@ -123,8 +130,18 @@ class APIService {
     }
     loadUsers() {
         return __awaiter(this, void 0, void 0, function* () {
-            const r = yield this.web.users.list();
+            const r = yield this.web.users.list({limit: 10000});
             this.users = r.members;
+            if (r.response_metadata && r.response_metadata.next_cursor) {
+                yield delay(RATE_LIMIT_DELAY);
+                const r2 = yield this.web.users.list({cursor: r.response_metadata.next_cursor});
+                this.users = this.users.concat(r2.members);
+            }
+
+            //const target = path_1.default.join(this.exportRoot, `users_${date_fns_1.format(new Date(), 'yyyy-MM-dd-HHmmss')}.json`);
+            //yield fs_1.promises.writeFile(target, JSON.stringify(this.users));
+
+            console.log('Number of users: ' + this.users.length);
             this.userMap = {};
             for (const u of this.users) {
                 this.userMap[u.id] = u;
@@ -133,7 +150,10 @@ class APIService {
     }
     loadConversations() {
         return __awaiter(this, void 0, void 0, function* () {
-            const r = yield this.web.conversations.list({ types: 'public_channel, private_channel, mpim, im' });
+            //public_channel, private_channel, mpim, im
+            yield delay(RATE_LIMIT_DELAY);
+            const r = yield this.web.conversations.list({ types: 'public_channel', /*exclude_archived: true, */limit: 1000 });
+            console.log('Number of channels: ' + r.channels.length);
             this.conversations = r.channels;
             for (const c of this.conversations) {
                 if (c.is_im) {
@@ -162,7 +182,7 @@ class APIService {
     buildSimpleMsg(msg) {
         const ms = Math.floor(parseFloat(msg.ts) * 1000);
         const date = new Date(ms);
-        //   const formatted = format(date, 'yyyy-MM-dd HH:mm:ss');    
+        //   const formatted = format(date, 'yyyy-MM-dd HH:mm:ss');
         const name = this.userMap[msg.user] ? this.userMap[msg.user].name : 'unknown';
         return {
             name: name,
@@ -201,10 +221,12 @@ class APIService {
             const jsonMsgs = [];
             let lastDate = oldestDate;
             let extraPages = false;
+            console.log(chalk_1.default.yellow(`    Conv ${conv.name} started`));
             while (true) {
                 if (extraPages) {
                     process.stdout.write('-');
                 }
+                yield delay(RATE_LIMIT_DELAY);
                 const data = yield this.web.conversations.history({
                     channel: conv === null || conv === void 0 ? void 0 : conv.id,
                     latest: newestDate ? APIService.dateToSlackTs(newestDate) : undefined,
@@ -215,7 +237,29 @@ class APIService {
                 const slackMsgs = data.messages;
                 for (const s of slackMsgs) {
                     const simpleMsg = this.buildSimpleMsg(s);
+
+                    if (s.thread_ts) {
+                        if (s.reply_count > 999) {
+                            console.log('Reply count is ' + s.reply_count + ' (' + s.thread_ts + ')');
+                        }
+                        process.stdout.write('+');
+                        yield delay(RATE_LIMIT_DELAY);
+                        const threadsData = yield this.web.conversations.replies({
+                            channel: conv.id,
+                            ts: s.thread_ts
+                        });
+
+                        s.thread_replies = threadsData.messages;
+
+                        simpleMsg.thread_replies = [];
+
+                        for (const tr of s.thread_replies) {
+                            simpleMsg.thread_replies.push(this.buildSimpleMsg(tr));
+                        }
+                    }
+
                     msgs.push(simpleMsg);
+
                     if (this.exportJson) {
                         jsonMsgs.push(s);
                     }
@@ -252,7 +296,7 @@ class APIService {
                 yield this.writeMsgs(this.exportRoot, conv, msgs);
                 lastDate = date_fns_1.add(msgs[msgs.length - 1].ts, { seconds: 1 });
                 if (this.exportJson) {
-                    const target = path_1.default.join(this.exportRoot, `${conv.type}-${sanitize_filename_1.default(conv.name)}_${date_fns_1.format(new Date(), 'yyyy-MM-dd-HHmmss')}.json`);
+                    const target = path_1.default.join(this.exportRoot, `${conv.type}-${sanitize_filename_1.default(conv.name || 'NONE')}_${date_fns_1.format(new Date(), 'yyyy-MM-dd-HHmmss')}.json`);
                     yield fs_1.promises.writeFile(target, JSON.stringify(jsonMsgs));
                 }
             }
@@ -266,10 +310,18 @@ class APIService {
     writeMsgs(root, conv, msgs) {
         return __awaiter(this, void 0, void 0, function* () {
             const lines = [];
-            const target = path_1.default.join(root, `${conv.type}-${sanitize_filename_1.default(conv.name)}_${date_fns_1.format(new Date(), 'yyyy-MM-dd-HHmmss')}.txt`);
+            const target = path_1.default.join(root, `${conv.type}-${sanitize_filename_1.default(conv.name || 'NONE')}_${date_fns_1.format(new Date(), 'yyyy-MM-dd-HHmmss')}.txt`);
             for (const m of msgs) {
                 const formatted = date_fns_1.format(m.ts, 'yyyy-MM-dd HH:mm:ss');
-                const line = `${formatted} ${m.name}: ${m.text}`;
+                let line = `${formatted} ${m.name}: ${m.text}`;
+
+                if (m.thread_replies && m.thread_replies.length) {
+                    line += '\r\n\t[Thread replies]:';
+                    for (const tr of m.thread_replies) {
+                        line += `\r\n\t${date_fns_1.format(tr.ts, 'yyyy-MM-dd HH:mm:ss')} ${tr.name}: ${tr.text}`;
+                    }
+                }
+
                 lines.push(line);
             }
             yield fs_1.promises.writeFile(target, lines.join('\r\n'));
